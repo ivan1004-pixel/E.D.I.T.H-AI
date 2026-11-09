@@ -1,0 +1,23 @@
+# Dependencias
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# Variables de entorno y secretos (NO subir a GitHub)
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env
+
+# Base de datos local con tokens OAuth
+*.db
+*.db-journal
+backend/data/
+
+# Compilados y caché
+dist/
+build/
+.vite/
+*.log
+.DS_Store
