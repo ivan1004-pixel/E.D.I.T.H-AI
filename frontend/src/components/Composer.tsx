@@ -9,12 +9,31 @@ import {
   Mic,
   Square,
   AlertCircle,
+  Volume2,
+  VolumeX,
+  Radio,
+  AudioLines,
 } from 'lucide-react';
 import { transcribeVoiceApi } from '../services/api';
+import {
+  getSelectedNeuralVoice,
+  NEURAL_VOICES,
+  setSelectedNeuralVoice,
+  speakWithEdith,
+} from '../services/voice';
 
 interface ComposerProps {
-  onSend: (message: string) => void;
+  onSend: (message: string, fromVoice?: boolean) => void;
   disabled?: boolean;
+  isEdithSpeaking?: boolean;
+  onStopSpeaking?: () => void;
+  voiceReplyEnabled?: boolean;
+  onToggleVoiceReply?: () => void;
+  handsFreeEnabled?: boolean;
+  onToggleHandsFree?: () => void;
+  wakeWord?: string;
+  onChangeWakeWord?: (word: string) => void;
+  isFollowUpWindowActive?: boolean;
 }
 
 interface ModeOption {
@@ -104,10 +123,57 @@ function audioBufferToWavBase64(audioBuffer: AudioBuffer): string {
   return btoa(binary);
 }
 
-export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
+/**
+ * Verifica si el texto transcrito contiene la palabra clave ("edith" o la que elija Ivan).
+ */
+function matchesWakeWord(spokenText: string, wakeWord: string): { matched: boolean; onlyWakeWord: boolean } {
+  const cleanWake = wakeWord.trim().toLowerCase();
+  if (!cleanWake) {
+    return { matched: true, onlyWakeWord: false };
+  }
+
+  const normalized = spokenText
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[.,¡!¿?]/g, '')
+    .trim();
+
+  const wakeVariants =
+    cleanWake === 'edith'
+      ? ['edith', 'edit', 'edid', 'hedith', 'edis', 'edyt', 'edy']
+      : [cleanWake];
+
+  const matched = wakeVariants.some((variant) => normalized.includes(variant));
+  if (!matched) {
+    return { matched: false, onlyWakeWord: false };
+  }
+
+  let remainder = normalized;
+  for (const variant of wakeVariants) {
+    remainder = remainder.replace(new RegExp(`\\b(hola|oye|hey|ok)?\\s*${variant}\\b`, 'gi'), '').trim();
+  }
+
+  return { matched: true, onlyWakeWord: remainder.length < 3 };
+}
+
+export const Composer: React.FC<ComposerProps> = ({
+  onSend,
+  disabled = false,
+  isEdithSpeaking = false,
+  onStopSpeaking,
+  voiceReplyEnabled = true,
+  onToggleVoiceReply,
+  handsFreeEnabled = false,
+  onToggleHandsFree,
+  wakeWord = 'edith',
+  onChangeWakeWord,
+  isFollowUpWindowActive = false,
+}) => {
   const [text, setText] = useState('');
   const [selectedMode, setSelectedMode] = useState<ModeOption>(MODES[0]);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [neuralVoice, setNeuralVoice] = useState<string>(getSelectedNeuralVoice());
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [voiceHint, setVoiceHint] = useState<{
@@ -121,14 +187,62 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
   const vadTimerRef = useRef<number | null>(null);
   const vadAudioCtxRef = useRef<AudioContext | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const localWakeTriggeredUntilRef = useRef<number>(0);
   const lastCompositionEndAt = useRef<number | null>(null);
   const inputId = useId();
+
+  // Refs actualizados para que el bucle continuo manos libres lea el estado más reciente
+  const stateRef = useRef({
+    disabled,
+    isEdithSpeaking,
+    isTranscribing,
+    handsFreeEnabled,
+    wakeWord,
+    isFollowUpWindowActive,
+    onSend,
+  });
+
+  useEffect(() => {
+    stateRef.current = {
+      disabled,
+      isEdithSpeaking,
+      isTranscribing,
+      handsFreeEnabled,
+      wakeWord,
+      isFollowUpWindowActive,
+      onSend,
+    };
+  }, [
+    disabled,
+    isEdithSpeaking,
+    isTranscribing,
+    handsFreeEnabled,
+    wakeWord,
+    isFollowUpWindowActive,
+    onSend,
+  ]);
 
   useEffect(() => {
     return () => {
       stopMediaStream();
     };
   }, []);
+
+  // Activar o detener el bucle de escucha continua manos libres ("Edith" / cualquier palabra)
+  useEffect(() => {
+    if (handsFreeEnabled) {
+      startHandsFreeMonitor();
+    } else {
+      stopMediaStream();
+      setIsRecording(false);
+      setVoiceHint(null);
+    }
+    return () => {
+      if (!handsFreeEnabled) {
+        stopMediaStream();
+      }
+    };
+  }, [handsFreeEnabled]);
 
   const stopMediaStream = () => {
     if (vadTimerRef.current !== null) {
@@ -145,16 +259,183 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
     }
   };
 
+  /**
+   * Monitor continuo de voz manos libres (0 consumo de API en silencio).
+   * Cuando detecta que Ivan habla y hace una pausa, transcribe el fragmento y verifica la palabra clave.
+   */
+  const startHandsFreeMonitor = async () => {
+    stopMediaStream();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const vadCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      vadAudioCtxRef.current = vadCtx;
+      const source = vadCtx.createMediaStreamSource(stream);
+      const analyser = vadCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+
+      const dataArray = new Float32Array(analyser.fftSize);
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+
+      let activeClipRecorder: MediaRecorder | null = null;
+      let clipChunks: Blob[] = [];
+      let speechStartAt = 0;
+      let lastVoiceAt = 0;
+      let busyProcessingClip = false;
+
+      setVoiceHint({
+        type: 'recording',
+        text: stateRef.current.wakeWord.trim()
+          ? `Manos libres activo: di "${stateRef.current.wakeWord}" seguido de tu instrucción`
+          : 'Manos libres activo: habla en cualquier momento y se enviará solo',
+      });
+
+      vadTimerRef.current = window.setInterval(() => {
+        const st = stateRef.current;
+        if (!st.handsFreeEnabled) return;
+
+        // Si Edith está hablando o procesando, pausamos la captura para que no se escuche a sí misma
+        if (st.disabled || st.isEdithSpeaking || st.isTranscribing || busyProcessingClip) {
+          if (activeClipRecorder && activeClipRecorder.state === 'recording') {
+            clipChunks = [];
+            activeClipRecorder.stop();
+            activeClipRecorder = null;
+          }
+          return;
+        }
+
+        analyser.getFloatTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          sumSquares += dataArray[i] * dataArray[i];
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+        const now = Date.now();
+
+        if (!activeClipRecorder || activeClipRecorder.state === 'inactive') {
+          if (rms > 0.019) {
+            clipChunks = [];
+            speechStartAt = now;
+            lastVoiceAt = now;
+            const rec = new MediaRecorder(stream, { mimeType });
+            rec.ondataavailable = (ev) => {
+              if (ev.data && ev.data.size > 0) clipChunks.push(ev.data);
+            };
+            rec.onstop = async () => {
+              setIsRecording(false);
+              const durationMs = Date.now() - speechStartAt;
+              const blob = new Blob(clipChunks, { type: mimeType });
+              if (durationMs < 400 || blob.size < 600 || st.disabled || st.isEdithSpeaking) {
+                return;
+              }
+
+              busyProcessingClip = true;
+              setIsTranscribing(true);
+              setVoiceHint({
+                type: 'transcribing',
+                text: 'Escuché tu voz, transcribiendo con Gemini...',
+              });
+
+              try {
+                const arrayBuffer = await blob.arrayBuffer();
+                const decodeCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+                const decodedBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
+                const wavBase64 = audioBufferToWavBase64(decodedBuffer);
+                await decodeCtx.close();
+
+                const spokenText = (await transcribeVoiceApi(wavBase64, 'audio/wav')).trim();
+                const cleanSpoken = spokenText
+                  .replace(/^\[silencio\]$/i, '')
+                  .replace(/^<noise>$/i, '')
+                  .trim();
+
+                setIsTranscribing(false);
+                busyProcessingClip = false;
+
+                if (!cleanSpoken || cleanSpoken.length < 2) {
+                  setVoiceHint({
+                    type: 'recording',
+                    text: stateRef.current.wakeWord.trim()
+                      ? `Manos libres activo: di "${stateRef.current.wakeWord}" para hablar con Edith`
+                      : 'Manos libres activo: te escucho...',
+                  });
+                  return;
+                }
+
+                const wakeCheck = matchesWakeWord(cleanSpoken, stateRef.current.wakeWord);
+                const inFollowUp =
+                  stateRef.current.isFollowUpWindowActive ||
+                  localWakeTriggeredUntilRef.current > Date.now();
+
+                if (wakeCheck.matched || inFollowUp) {
+                  if (wakeCheck.onlyWakeWord && !inFollowUp) {
+                    localWakeTriggeredUntilRef.current = Date.now() + 30000;
+                    setVoiceHint({
+                      type: 'recording',
+                      text: 'Te escucho, Ivan. Di tu instrucción y se enviará automáticamente...',
+                    });
+                  } else {
+                    localWakeTriggeredUntilRef.current = Date.now() + 30000;
+                    setVoiceHint(null);
+                    stateRef.current.onSend(cleanSpoken, true);
+                  }
+                } else {
+                  setVoiceHint({
+                    type: 'recording',
+                    text: `Escuché "${cleanSpoken.slice(0, 28)}..." (di "${stateRef.current.wakeWord}" para activar o deja vacía la palabra clave)`,
+                  });
+                }
+              } catch {
+                setIsTranscribing(false);
+                busyProcessingClip = false;
+              }
+            };
+
+            activeClipRecorder = rec;
+            rec.start();
+            setIsRecording(true);
+            setVoiceHint({
+              type: 'recording',
+              text: 'Capturando tu voz... Se enviará al terminar de hablar',
+            });
+          }
+        } else if (activeClipRecorder.state === 'recording') {
+          if (rms > 0.015) {
+            lastVoiceAt = now;
+          } else if (now - lastVoiceAt > 1350 || now - speechStartAt > 15000) {
+            activeClipRecorder.stop();
+          }
+        }
+      }, 100);
+    } catch {
+      setVoiceHint({
+        type: 'error',
+        text: 'Permite el acceso al micrófono en Opera GX para usar el modo manos libres.',
+      });
+    }
+  };
+
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = text.trim();
     if (!trimmed || disabled || isTranscribing) return;
-    onSend(trimmed);
+    onSend(trimmed, false);
     setText('');
   };
 
+  /**
+   * Dictado directo de 1 toque (con envío automático al terminar de hablar).
+   */
   const toggleVoiceDictation = async () => {
     if (disabled || isTranscribing) return;
+
+    if (handsFreeEnabled && onToggleHandsFree) {
+      onToggleHandsFree();
+    }
 
     if (isRecording && mediaRecorderRef.current) {
       if (mediaRecorderRef.current.state !== 'inactive') {
@@ -215,7 +496,7 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
 
           if (cleanSpoken) {
             setText('');
-            onSend(cleanSpoken);
+            onSend(cleanSpoken, true);
           } else {
             setVoiceHint({
               type: 'error',
@@ -241,7 +522,6 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
         text: 'Escuchando... Al terminar de hablar se enviará automáticamente',
       });
 
-      // Detector automático de silencio (Voice Activity Detection) para enviar al terminar de hablar
       try {
         const vadCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
         vadAudioCtxRef.current = vadCtx;
@@ -270,22 +550,20 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
           if (rms > 0.016) {
             hasSpoken = true;
             lastSpeechTime = now;
-          } else if (hasSpoken && now - lastSpeechTime > 1500) {
-            // 1.5 segundos de silencio tras haber hablado -> detener y enviar automáticamente
+          } else if (hasSpoken && now - lastSpeechTime > 1400) {
             if (mediaRecorderRef.current.state === 'recording') {
               mediaRecorderRef.current.stop();
             }
           } else if (!hasSpoken && now - startedAt > 9000) {
-            // Si pasaron 9 segundos sin hablar, cerrar micrófono
             if (mediaRecorderRef.current.state === 'recording') {
               mediaRecorderRef.current.stop();
             }
           }
         }, 100);
       } catch {
-        // Si el navegador bloquea el AnalyserNode secundario, el botón manual sigue funcionando
+        // Fallback manual
       }
-    } catch (err: any) {
+    } catch {
       setIsRecording(false);
       setVoiceHint({
         type: 'error',
@@ -317,7 +595,41 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
   return (
     <div className="composer-container">
       <div className="composer-inner">
-        {voiceHint && (
+        {isEdithSpeaking && (
+          <div
+            className="voice-status-pill"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              background: '#171717',
+              color: '#fff',
+            }}
+          >
+            <AudioLines size={14} />
+            <span>Edith te está respondiendo por voz...</span>
+            {onStopSpeaking && (
+              <button
+                type="button"
+                onClick={onStopSpeaking}
+                style={{
+                  marginLeft: '6px',
+                  padding: '2px 8px',
+                  borderRadius: '999px',
+                  border: '1px solid rgba(255,255,255,0.3)',
+                  background: 'transparent',
+                  color: '#fff',
+                  fontSize: '0.74rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Callar voz
+              </button>
+            )}
+          </div>
+        )}
+
+        {!isEdithSpeaking && voiceHint && (
           <div
             className="voice-status-pill"
             style={{ display: 'inline-flex', alignItems: 'center', gap: '7px' }}
@@ -367,7 +679,13 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
             id={inputId}
             className="composer-input"
             rows={1}
-            placeholder="Escribe o haz clic en Dictar para hablar con Edith..."
+            placeholder={
+              handsFreeEnabled
+                ? wakeWord.trim()
+                  ? `Modo Voz a Voz activo: di "${wakeWord}" seguido de lo que necesites...`
+                  : 'Modo Voz a Voz activo: habla libremente y Edith te contestará con voz...'
+                : 'Escribe o usa Voz a Voz / Dictar para hablar con Edith...'
+            }
             value={text}
             onChange={(e) => setText(e.target.value)}
             onCompositionEnd={(e) => {
@@ -377,35 +695,113 @@ export const Composer: React.FC<ComposerProps> = ({ onSend, disabled }) => {
             disabled={disabled || isTranscribing}
           />
 
-          <div className="composer-bottom-bar">
-            <button
-              type="button"
-              className="model-selector-pill"
-              onClick={() => setMenuOpen((prev) => !prev)}
-            >
-              {selectedMode.icon}
-              <span>{selectedMode.name}</span>
-              <ChevronDown size={13} />
-            </button>
+          <div className="composer-bottom-bar" style={{ flexWrap: 'wrap', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="model-selector-pill"
+                onClick={() => setMenuOpen((prev) => !prev)}
+              >
+                {selectedMode.icon}
+                <span>{selectedMode.name}</span>
+                <ChevronDown size={13} />
+              </button>
+
+              {onToggleVoiceReply && (
+                <button
+                  type="button"
+                  className="model-selector-pill"
+                  onClick={onToggleVoiceReply}
+                  title="Activar o silenciar la voz hablada de Edith"
+                  style={{
+                    borderColor: voiceReplyEnabled ? 'var(--accent)' : undefined,
+                    color: voiceReplyEnabled ? 'var(--accent)' : undefined,
+                  }}
+                >
+                  {voiceReplyEnabled ? <Volume2 size={14} /> : <VolumeX size={14} />}
+                  <span>{voiceReplyEnabled ? 'Voz Edith: ON' : 'Voz Edith: OFF'}</span>
+                </button>
+              )}
+
+              {voiceReplyEnabled && (
+                <select
+                  className="model-selector-pill"
+                  value={neuralVoice}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setNeuralVoice(v);
+                    setSelectedNeuralVoice(v);
+                    speakWithEdith('Hola Ivan, esta es mi nueva voz neuronal.', undefined, v);
+                  }}
+                  title="Elige la voz neuronal natural de Edith"
+                  style={{ cursor: 'pointer', outline: 'none' }}
+                >
+                  {NEURAL_VOICES.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              )}
+
+              {onToggleHandsFree && (
+                <button
+                  type="button"
+                  className={`mic-dictate-btn ${handsFreeEnabled ? 'listening' : ''}`}
+                  onClick={onToggleHandsFree}
+                  title="Activa la escucha continua Voz a Voz al decir la palabra clave"
+                >
+                  <Radio size={14} />
+                  <span>{handsFreeEnabled ? 'Voz a Voz: ACTIVO' : 'Activar Voz a Voz'}</span>
+                </button>
+              )}
+
+              {handsFreeEnabled && onChangeWakeWord && (
+                <div
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '4px',
+                    background: 'rgba(0,0,0,0.04)',
+                    padding: '3px 8px',
+                    borderRadius: '999px',
+                    fontSize: '0.75rem',
+                  }}
+                  title="Palabra clave para activar (déjalo vacío si quieres que se active con cualquier palabra)"
+                >
+                  <span>Palabra:</span>
+                  <input
+                    type="text"
+                    value={wakeWord}
+                    onChange={(e) => onChangeWakeWord(e.target.value)}
+                    placeholder="cualquiera"
+                    style={{
+                      width: '68px',
+                      border: 'none',
+                      background: 'transparent',
+                      fontWeight: 600,
+                      fontSize: '0.76rem',
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+              )}
+            </div>
 
             <div className="composer-right-actions">
               <button
                 type="button"
-                className={`mic-dictate-btn ${isRecording ? 'listening' : ''}`}
+                className={`mic-dictate-btn ${isRecording && !handsFreeEnabled ? 'listening' : ''}`}
                 onClick={toggleVoiceDictation}
                 disabled={disabled || isTranscribing}
-                title={
-                  isRecording
-                    ? 'Haz clic para terminar de grabar, transcribir y enviar'
-                    : 'Dictar por voz con Gemini'
-                }
+                title="Dictar un mensaje (se envía solo al terminar de hablar)"
               >
-                {isRecording ? <Square size={13} /> : <Mic size={15} />}
+                {isRecording && !handsFreeEnabled ? <Square size={13} /> : <Mic size={15} />}
                 <span>
                   {isTranscribing
                     ? 'Transcribiendo...'
-                    : isRecording
-                    ? 'Enviar voz'
+                    : isRecording && !handsFreeEnabled
+                    ? 'Escuchando...'
                     : 'Dictar'}
                 </span>
               </button>

@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 import {
   chatWithEdith,
   clearChatHistory,
@@ -10,6 +11,78 @@ import {
 } from '../services/openai';
 
 const router = Router();
+
+/**
+ * POST /api/chat/tts
+ * Sintetiza texto en una voz neuronal hiperrealista en español (por defecto es-MX-DaliaNeural)
+ * sin costo ($0.00), con respaldo automático en Google Neural TTS.
+ */
+router.post('/tts', async (req: Request, res: Response) => {
+  try {
+    const rawText = String(req.body?.text || '').trim();
+    const voiceName = String(req.body?.voice || 'es-MX-DaliaNeural').trim();
+
+    if (!rawText) {
+      res.status(400).json({ ok: false, error: 'No se proporcionó texto para sintetizar.' });
+      return;
+    }
+
+    const cleanText = rawText
+      .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F]/gu, '')
+      .replace(/```[\s\S]*?```/g, ' bloque de código ')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/^#{1,6}\s+/gm, '')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 1800);
+
+    try {
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(voiceName, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+      const { audioStream } = tts.toStream(cleanText);
+      const chunks: Buffer[] = [];
+      for await (const chunk of audioStream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      const audioBuffer = Buffer.concat(chunks);
+      if (audioBuffer.length > 200) {
+        res.json({
+          ok: true,
+          audioBase64: audioBuffer.toString('base64'),
+          mimeType: 'audio/mpeg',
+          engine: 'edge-neural',
+        });
+        return;
+      }
+    } catch (edgeErr) {
+      console.warn('Edge Neural TTS fallback a Google Neural TTS:', edgeErr);
+    }
+
+    // Respaldo automático con Google Neural TTS
+    const gUrl =
+      'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=es-MX&q=' +
+      encodeURIComponent(cleanText.slice(0, 200));
+    const gRes = await fetch(gUrl);
+    if (!gRes.ok) {
+      throw new Error('No se pudo generar el audio neuronal.');
+    }
+    const arrBuf = await gRes.arrayBuffer();
+    res.json({
+      ok: true,
+      audioBase64: Buffer.from(arrBuf).toString('base64'),
+      mimeType: 'audio/mpeg',
+      engine: 'google-neural',
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || 'Error al sintetizar voz neuronal.',
+    });
+  }
+});
 
 /**
  * GET /api/chat/conversations

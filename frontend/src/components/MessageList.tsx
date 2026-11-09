@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Copy, Check, Code2, ChevronRight, Sparkles } from 'lucide-react';
+import { Copy, Check, Code2, ChevronRight, Sparkles, Volume2 } from 'lucide-react';
 import { ChatMessage } from '../services/api';
+import { speakWithEdith } from '../services/voice';
 
 interface MessageListProps {
   messages: ChatMessage[];
@@ -253,6 +254,13 @@ export const MessageList: React.FC<MessageListProps> = ({
                   )}
 
                   <div className="msg-action-bar left">
+                    <button
+                      className="copy-icon-btn"
+                      onClick={() => speakWithEdith(msg.content)}
+                      title="Escuchar respuesta con la voz de Edith"
+                    >
+                      <Volume2 size={13} />
+                    </button>
                     <button
                       className="copy-icon-btn"
                       onClick={() => handleCopy(msg.content, idx)}
